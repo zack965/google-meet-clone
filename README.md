@@ -558,3 +558,415 @@ AWS_DEFAULT_REGION=us-east-1   # must be a Chime SDK Meetings-supported region
 Read via `config('services.aws.*')` (`config/services.php`), not `config('services.ses.*')`
 — the `ses` block in that file is unrelated (Simple Email Service) and just happens to read
 the same underlying env vars.
+
+---
+
+## Appendix: every client-side Chime SDK interaction, piece by piece
+
+The [Frontend walkthrough](#frontend-walkthrough) above covers the shape of things. This
+appendix goes line by line through every place client code touches `amazon-chime-sdk-js`
+(and, for contrast, the one place it *doesn't* — the Lobby's mic preview). If you're porting
+this pattern into your own app, this is the part to read closely: almost all of the
+Chime-specific logic in the whole project lives in one file,
+`resources/js/hooks/use-chime-meeting.ts`. Everything outside that file only ever touches
+the plain JS/TS values the hook returns (`connectionState`, `roster`, `isMuted`) — no other
+component imports from `amazon-chime-sdk-js` at all. That boundary is deliberate: it means
+you could swap the whole SDK integration out later without touching a single UI component.
+
+### The imports
+
+```ts
+import {
+    ConsoleLogger,
+    DefaultDeviceController,
+    DefaultMeetingSession,
+    LogLevel,
+    MeetingSessionStatusCode,
+    MeetingSessionConfiguration,
+} from 'amazon-chime-sdk-js';
+```
+
+These are the five building blocks the SDK expects you to compose yourself — there is no
+single "connect" call. Roughly:
+
+| Import | What it is |
+|---|---|
+| `MeetingSessionConfiguration` | Parses the raw JSON your backend returned (`createMeeting`/`createAttendee` responses) into the URLs, IDs, and join token the SDK needs internally. Pure data, no side effects when constructed. |
+| `DefaultDeviceController` | Owns device access — enumerating/selecting microphones, and (per the `enableWebAudio` option) routing audio through the Web Audio API instead of a plain `<audio>` tag, which is what lets the SDK measure per-attendee volume. |
+| `DefaultMeetingSession` | The actual session object. Combines the configuration + device controller into something with an `.audioVideo` facade you call everything else through. Constructing it does **not** connect to anything yet — that only happens on `.audioVideo.start()`. |
+| `ConsoleLogger` / `LogLevel` | The SDK is chatty internally (ICE negotiation, reconnection attempts, etc.) and wants an explicit logger injected — there's no default. `LogLevel.WARN` keeps that noise out of the console while still surfacing real problems. |
+| `MeetingSessionStatusCode` | An enum of reasons a session stopped (`OK`, `Left`, `MeetingEnded`, `AudioAttendeeRemoved`, ...). You get one of these back in the `audioVideoDidStop` observer and have to branch on it yourself — the SDK doesn't pre-classify "the meeting ended" vs. "you lost network" for you. |
+
+### The types (`RosterEntry`, `AwsMeeting`, `AwsAttendee`, `ChimeConnectionState`)
+
+```ts
+export type RosterEntry = {
+    attendeeId: string;
+    name: string;
+    isLocal: boolean;
+    muted: boolean;
+    speaking: boolean;
+};
+
+export type AwsMeeting = Record<string, unknown>;
+export type AwsAttendee = { AttendeeId: string } & Record<string, unknown>;
+
+export type ChimeConnectionState =
+    'idle' | 'connecting' | 'connected' | 'left' | 'ended' | 'error';
+```
+
+None of these come from the SDK — the SDK's own types for a "meeting" or "attendee" are
+untyped `any`-ish blobs (`MeetingSessionConfiguration`'s constructor literally accepts
+`any`), because they're just AWS API JSON passed straight through. `RosterEntry` is *our*
+shape, built by combining three separate pieces of information the SDK gives us
+independently (presence tells us an attendee ID exists; our own backend tells us their name;
+the volume indicator tells us mute/speaking state) — the SDK never hands you a "roster"
+object, you assemble one yourself from these callbacks. `ChimeConnectionState` is our own
+small state machine layered on top of the SDK's lower-level per-event callbacks, so the UI
+(`meetings/show.tsx`) can `switch` on one value instead of tracking several booleans.
+
+### Refs: `sessionRef`, `audioElementRef`, `nameCacheRef`
+
+```ts
+const sessionRef = useRef<DefaultMeetingSession | null>(null);
+const audioElementRef = useRef<HTMLAudioElement | null>(null);
+const nameCacheRef = useRef<Map<string, string>>(new Map());
+```
+
+`DefaultMeetingSession` is a stateful, non-serializable object with open network
+connections — it can never go into React state (`useState`) because it's not something React
+should re-render on or clone; it has to live in a `ref` that every callback closes over.
+Same reasoning for the injected `<audio>` element (a real DOM node) and the name cache (a
+`Map`, mutated in place rather than triggering re-renders on every cache hit — only actual
+roster changes should re-render the UI).
+
+### `resolveAttendeeName` — bridging Chime's anonymous IDs to real names
+
+```ts
+const resolveAttendeeName = useCallback(
+    async (attendeeId: string): Promise<string> => {
+        const cached = nameCacheRef.current.get(attendeeId);
+        if (cached) return cached;
+
+        try {
+            const response = (await fetchAttendeeName(
+                AttendeeController.show([meetingUuid, attendeeId]).url,
+            )) as { name?: string };
+            const name = response?.name ?? 'Guest';
+            nameCacheRef.current.set(attendeeId, name);
+            return name;
+        } catch {
+            return 'Guest';
+        }
+    },
+    [fetchAttendeeName, meetingUuid],
+);
+```
+
+Not an SDK call at all — this is the glue that covers the gap the SDK leaves open (see
+[`AttendeeController`](#attendeecontroller)): Chime only ever gives you an opaque
+`attendeeId` string, never a display name. `fetchAttendeeName` is Inertia v3's `useHttp`
+hook's `get`, hitting our own `GET /meetings/{uuid}/attendees/{attendeeId}` endpoint. The
+`Map` cache means each attendee's name is looked up from our backend exactly once per
+session, no matter how many times their volume-indicator callback fires (which is often —
+several times a second while they're talking).
+
+### `leave` — tearing a session down
+
+```ts
+const leave = useCallback(async () => {
+    const session = sessionRef.current;
+    if (session) {
+        session.audioVideo.stop();
+        await session.destroy();
+        sessionRef.current = null;
+    }
+    if (audioElementRef.current) {
+        audioElementRef.current.remove();
+        audioElementRef.current = null;
+    }
+    setRoster({});
+}, []);
+```
+
+- **`session.audioVideo.stop()`** — closes the signaling connection and all WebRTC peer
+  connections, stops sending/receiving audio. This alone is enough to leave the call from
+  every other attendee's point of view (they'll get a `present: false` presence callback).
+- **`session.destroy()`** — releases everything `stop()` didn't: internal event listeners,
+  Web Audio nodes, timers. The SDK explicitly documents this as required cleanup beyond
+  `stop()` — skipping it leaks memory/handles if the user joins and leaves several meetings
+  in one page session (which, in a SPA like this, is exactly what happens on every
+  navigation).
+- Removing the `<audio>` element and clearing `sessionRef` prevent a stale session from being
+  reused by a later `join()` call.
+- This function is called from **two** places: the explicit "Leave" button
+  (`show.tsx`'s `handleLeave`) and a `useEffect` cleanup (see below) that fires on unmount —
+  so navigating away without clicking "Leave" still tears the session down correctly.
+
+### `join` — the main event
+
+This is the only function that actually opens a connection to AWS. Walking through it top to
+bottom:
+
+**1. Build the session object (no network activity yet):**
+```ts
+const logger = new ConsoleLogger('ChimeMeeting', LogLevel.WARN);
+const deviceController = new DefaultDeviceController(logger, { enableWebAudio: true });
+const configuration = new MeetingSessionConfiguration(
+    { Meeting: awsMeeting },
+    { Attendee: awsAttendee },
+);
+const session = new DefaultMeetingSession(configuration, logger, deviceController);
+sessionRef.current = session;
+```
+`awsMeeting`/`awsAttendee` are the exact JSON objects `AttendeeController::store` returned —
+this is the one contract point between backend and frontend that has to match AWS's own
+response shape (we deliberately don't reshape them anywhere in between, precisely so this
+constructor call keeps working unmodified). `MeetingSessionConfiguration` reads out of that
+JSON: the signaling WebSocket URL, the media placement (which literal AWS media server to
+connect to), the meeting ID, the attendee ID, and the secret join token — everything the SDK
+needs to authenticate and route the connection, entirely without your app's backend being
+involved again.
+
+**2. Pick a microphone and start sending audio:**
+```ts
+const audioInputDevices = await session.audioVideo.listAudioInputDevices();
+await session.audioVideo.startAudioInput(audioInputDevices[0]?.deviceId ?? null);
+```
+`listAudioInputDevices()` triggers the browser's device-enumeration + (if not already
+granted) the microphone permission prompt. We don't build a picker UI — we just take
+`[0]`, the browser's default microphone, falling back to `null` (a generated silent stream)
+if literally no input device exists at all, so a machine with no mic can still join and
+listen. `startAudioInput` is what actually opens the `getUserMedia` stream and hands it to
+the device controller; nothing is sent to AWS yet, that only happens once `.start()` (step 5)
+opens the peer connection.
+
+**3. Play everyone else's audio:**
+```ts
+const audioElement = document.createElement('audio');
+audioElement.style.display = 'none';
+document.body.appendChild(audioElement);
+audioElementRef.current = audioElement;
+await session.audioVideo.bindAudioElement(audioElement);
+```
+The SDK doesn't manage its own output element for you — it needs a real `<audio>` DOM node
+to attach the mixed remote audio stream to. We create one dynamically (hidden — there's
+nothing to visually show for it) rather than putting one in JSX, since this needs to happen
+exactly once per session and needs a ref back to it for cleanup in `leave()`. **Forget this
+step and the call "works" (you show as connected, roster updates fine) but is completely
+silent** — this is the single easiest piece to accidentally leave out when adapting this
+code, and the bug it causes is invisible: no error, just no sound.
+
+**4. Seed your own roster entry:**
+```ts
+setRoster({
+    [awsAttendee.AttendeeId]: {
+        attendeeId: awsAttendee.AttendeeId,
+        name,
+        isLocal: true,
+        muted: false,
+        speaking: false,
+    },
+});
+```
+Not strictly necessary — the presence subscription below will fire for you too, moments
+later — but this makes your own tile appear on screen instantly rather than waiting a
+network round trip, and lets us set `name` directly from what was typed in the Lobby instead
+of round-tripping to `resolveAttendeeName` for ourselves.
+
+**5. Subscribe to who's in the call — `realtimeSubscribeToAttendeeIdPresence`:**
+```ts
+session.audioVideo.realtimeSubscribeToAttendeeIdPresence((attendeeId, present) => {
+    if (!present) {
+        setRoster((prev) => { const next = { ...prev }; delete next[attendeeId]; return next; });
+        return;
+    }
+
+    const isLocal = attendeeId === awsAttendee.AttendeeId;
+    setRoster((prev) => ({
+        ...prev,
+        [attendeeId]: prev[attendeeId] ?? { attendeeId, name: isLocal ? name : '…', isLocal, muted: false, speaking: false },
+    }));
+
+    if (!isLocal) {
+        resolveAttendeeName(attendeeId).then((resolvedName) => {
+            setRoster((prev) => prev[attendeeId] ? { ...prev, [attendeeId]: { ...prev[attendeeId], name: resolvedName } } : prev);
+        });
+    }
+
+    session.audioVideo.realtimeSubscribeToVolumeIndicator(attendeeId, (id, volume, muted) => {
+        setRoster((prev) => prev[id] ? { ...prev, [id]: { ...prev[id], muted: muted ?? prev[id].muted, speaking: (volume ?? 0) > SPEAKING_VOLUME_THRESHOLD } } : prev);
+    });
+});
+```
+This single callback is doing three distinct jobs, worth separating mentally even though
+they're one function:
+
+- **Presence itself.** Chime calls this callback for *every* attendee currently in (or
+  joining/leaving) the meeting, including yourself — that's why there's an `isLocal` check
+  rather than filtering yourself out entirely. `present === false` means someone
+  disconnected (they clicked Leave, closed the tab, lost network, or the owner ended the
+  meeting for everyone) — we just delete them from the roster `Record`. `present === true`
+  means a new attendee showed up; we insert a placeholder (`name: '…'`) immediately so the
+  tile appears before we know who they are.
+- **Name resolution**, kicked off only for non-local attendees (`if (!isLocal)`) — this is
+  the call into `resolveAttendeeName` described above, which lands asynchronously and
+  patches the placeholder `'…'` with the real name once our backend responds. There's a
+  `prev[attendeeId] ?` guard in the `.then()` because by the time the name resolves, that
+  attendee may have already left — without the guard you'd resurrect a roster entry for
+  someone who's already gone.
+- **Registering the volume subscription** (next bullet) — deliberately done *inside* the
+  presence callback, once per attendee, rather than once globally, because
+  `realtimeSubscribeToVolumeIndicator` requires a specific `attendeeId` to subscribe to; you
+  can't ask for "everyone's volume" in one call.
+
+**6. Subscribe to mute state + speaking — `realtimeSubscribeToVolumeIndicator`:**
+```ts
+session.audioVideo.realtimeSubscribeToVolumeIndicator(attendeeId, (id, volume, muted) => {
+    setRoster((prev) => prev[id] ? {
+        ...prev,
+        [id]: { ...prev[id], muted: muted ?? prev[id].muted, speaking: (volume ?? 0) > SPEAKING_VOLUME_THRESHOLD },
+    } : prev);
+});
+```
+Fires continuously (many times a second) for each attendee while the meeting is active, with
+`volume` as a `number | null` between 0–1 (`null` briefly during connection setup, before the
+SDK has a reading yet — hence `volume ?? 0`, treating "no reading yet" as silent rather than
+crashing on `null > threshold`) and `muted` as `boolean | null`. `SPEAKING_VOLUME_THRESHOLD`
+(`0.15`, defined at the top of the file) is our own arbitrary cutoff for "loud enough to
+count as talking" — the SDK reports a continuous number, not a boolean "is speaking," so we
+have to pick that threshold ourselves. This is also the piece that drives the glowing ring on
+`ParticipantTile` — nothing about it is Chime-specific rendering, it's just a `boolean` prop
+by the time it reaches that component.
+
+**7. Detect the session ending — `addObserver` / `audioVideoDidStop`:**
+```ts
+session.audioVideo.addObserver({
+    audioVideoDidStop: (sessionStatus) => {
+        const code = sessionStatus.statusCode();
+        if (code === MeetingSessionStatusCode.MeetingEnded
+            || code === MeetingSessionStatusCode.AudioAttendeeRemoved
+            || code === MeetingSessionStatusCode.TURNCredentialsForbidden) {
+            setConnectionState('ended');
+        } else if (code === MeetingSessionStatusCode.Left) {
+            setConnectionState('left');
+        } else if (code !== MeetingSessionStatusCode.OK) {
+            setConnectionState('error');
+        }
+    },
+});
+```
+`AudioVideoObserver` is the SDK's general-purpose event interface — it has other hooks too
+(`audioVideoDidStart`, `videoTileDidUpdate`, connection-health callbacks, etc.) but
+`audioVideoDidStop` is the only one this audio-only app needs: it's called exactly once,
+whenever the session stops for *any* reason, and hands you a `MeetingSessionStatus` you
+interrogate via `.statusCode()`. We only branch on the codes that matter for this app's UX:
+  - `MeetingEnded` — the case that matters most: this is how a guest's browser finds out the
+    **owner ended the meeting** (`DELETE /meetings/{uuid}` → AWS `DeleteMeeting` → AWS itself
+    forcibly disconnects every attendee with this status code). No message from our own
+    backend is involved — Chime's own teardown carries the information.
+  - `AudioAttendeeRemoved` / `TURNCredentialsForbidden` — both effectively mean "you're no
+    longer welcome in this meeting" (e.g. the meeting was deleted between you loading the
+    page and actually connecting) — treated the same as `MeetingEnded` for UI purposes.
+  - `Left` — the *expected* code when **you** called `audioVideo.stop()` yourself (via our
+    own `leave()`) — shown as "You left the meeting" rather than "This meeting has ended."
+  - Anything else non-`OK` (network failure, signaling error, etc.) falls through to a
+    generic `'error'` state.
+
+**8. Actually connect:**
+```ts
+session.audioVideo.start();
+setConnectionState('connected');
+```
+Everything above this line was setup — `.start()` is the call that opens the real WebSocket
+signaling connection and WebRTC peer connection to AWS's media servers and begins
+sending/receiving audio. It's synchronous from the caller's point of view (fire-and-forget;
+connection progress is reported asynchronously through the observer registered in step 7,
+via `audioVideoDidStart`/`audioVideoDidStartConnecting` if you were listening for them — this
+app doesn't, it optimistically flips to `'connected'` immediately since the whole flow up to
+here already required the mic and signaling info to be valid).
+
+**9. Anything throws → generic error, logged:**
+```ts
+} catch (error) {
+    console.error('[ChimeMeeting] failed to join', error);
+    setConnectionState('error');
+}
+```
+Wraps the entire sequence above. Realistic failure causes: microphone permission denied,
+`getUserMedia` unavailable (non-secure context — see [Gotchas](#gotchas-we-hit-and-fixed)),
+malformed `awsMeeting`/`awsAttendee` JSON, or a browser missing WebRTC support entirely. The
+`console.error` matters more than it looks — an earlier version of this code had a bare
+`catch { setConnectionState('error') }` with no logging, which produced a UI that correctly
+said "something went wrong" but gave zero information for debugging *why*. Always log the
+real error before collapsing it into a generic user-facing state.
+
+### `toggleMute` — local-only, no network round trip
+
+```ts
+const toggleMute = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+
+    if (session.audioVideo.realtimeIsLocalAudioMuted()) {
+        session.audioVideo.realtimeUnmuteLocalAudio();
+        setIsMuted(false);
+    } else {
+        session.audioVideo.realtimeMuteLocalAudio();
+        setIsMuted(true);
+    }
+}, []);
+```
+All three of these (`realtimeIsLocalAudioMuted`, `realtimeMuteLocalAudio`,
+`realtimeUnmuteLocalAudio`) are synchronous, local SDK state — muting stops your outbound
+audio track from being sent, instantly, without asking AWS anything. Other attendees find
+out you're muted through *their* volume-indicator subscription (the `muted` field from step
+6 above) — there's no separate "broadcast my mute state" call, it's implied by the
+signaling layer.
+
+### Cleanup on unmount
+
+```ts
+useEffect(() => {
+    return () => {
+        void leave();
+    };
+}, [leave]);
+```
+A safety net independent of the "Leave" button: if the user navigates away, closes the tab,
+or the component unmounts for any other reason, this fires and tears the session down the
+same way `handleLeave` does. `void` because `leave()` is `async` but a `useEffect` cleanup
+function can't itself be async — we intentionally don't await it (nothing left to do with the
+result once the component's gone).
+
+### What's *not* Chime: the Lobby's mic preview
+
+`resources/js/components/meeting/lobby.tsx` shows a live microphone level meter **before**
+you've joined — deliberately built with plain browser APIs, not the SDK, because there's no
+`DefaultMeetingSession` to use yet (that only gets constructed once you have a `Meeting`
++ `Attendee` pair, which only exists after clicking "Join now"):
+```ts
+const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+const audioContext = new AudioContext();
+const source = audioContext.createMediaStreamSource(stream);
+const analyser = audioContext.createAnalyser();
+source.connect(analyser);
+// ...requestAnimationFrame loop reading analyser.getByteFrequencyData()...
+```
+This stream is explicitly stopped (`stream.getTracks().forEach(t => t.stop())`) the moment
+"Join now" is clicked, *before* handing off to `useChimeMeeting.join()` — which then opens
+its own, independent `getUserMedia` call via `startAudioInput`. The two never share a stream;
+the Lobby's is purely cosmetic (so you can see your mic is working and pre-mute if you want),
+and gets thrown away once the real session takes over.
+
+### How the page ties it all together
+
+`resources/js/pages/meetings/show.tsx` never imports anything from `amazon-chime-sdk-js`
+directly — it only calls `useChimeMeeting(meeting.uuid)` and reads back
+`{ connectionState, isMuted, roster, join, leave, toggleMute }`, rendering `<Lobby>`,
+a connecting spinner, `<CallRoom>`, or an "ended/left" screen purely by switching on
+`connectionState`. `chime.join` is passed straight through as the `Lobby`'s `onJoin` prop —
+the Lobby doesn't know or care that it's a Chime session being opened, it just knows "call
+this function with a name and two JSON blobs once the join request succeeds." That's the
+whole point of keeping every SDK call inside the one hook: the rest of the UI is testable
+and reasonable about without ever touching WebRTC concepts.
