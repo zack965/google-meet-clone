@@ -21,6 +21,7 @@ This document is written so you can lift the pattern into your own project. It e
 
 - [How it fits together](#how-it-fits-together)
 - [AWS setup](#aws-setup)
+  - [IAM policy JSON](#iam-policy-json)
 - [Two SDKs, two jobs](#two-sdks-two-jobs)
 - [Data model](#data-model)
 - [Backend walkthrough](#backend-walkthrough)
@@ -82,24 +83,93 @@ real-time layer replaces that entirely for the call itself.
 
 You need:
 
-1. An AWS account with an IAM user/role that has `chime:CreateMeeting`,
-   `chime:DeleteMeeting`, `chime:CreateAttendee` (the *Chime SDK Meetings* permissions,
-   not classic Chime). The AWS-managed policy `AmazonChimeSDK` covers this.
+1. An AWS account with an IAM user/role that has, at minimum, the permissions in
+   [IAM policy JSON](#iam-policy-json) below — Chime SDK Meetings for the call itself, plus
+   Transcribe/Polly/S3 for the AI voice round-trip (`AiController`). The AWS-managed policy
+   `AmazonChimeSDK` covers the Chime half if you'd rather attach a managed policy for that
+   part and only hand-roll the Transcribe/Polly/S3 statements.
 2. Access key + secret for that principal, placed in `.env`:
    ```
    AWS_ACCESS_KEY_ID=...
    AWS_SECRET_ACCESS_KEY=...
    AWS_DEFAULT_REGION=us-east-1
+   AWS_BUCKET=...
    ```
    Chime SDK Meetings is only available in a handful of regions (e.g. `us-east-1`,
    `us-west-2`, `eu-central-1`...) — check the [AWS docs](https://docs.aws.amazon.com/general/latest/gr/chime-sdk.html)
    for the current list. `config('services.aws.region')` is used both as the AWS client
    region *and* as the Chime `MediaRegion` (where the actual audio gets routed) — you can
    split these if you want meetings routed to a region different from your API calls.
-3. Nothing else. No S3 bucket, no separate Chime "phone number", no Cognito. Meetings and
-   Attendees are ephemeral AWS resources — you don't provision them ahead of time, you just
-   call the API and AWS spins them up on demand. They also auto-expire after a period with
-   no connected attendees, so a crashed server won't leave stray infrastructure running.
+3. Meetings and Attendees themselves are ephemeral AWS resources — you don't provision them
+   ahead of time, you just call the API and AWS spins them up on demand, and they auto-expire
+   after a period with no connected attendees. The one persistent resource you *do* need to
+   create yourself is the S3 bucket named by `AWS_BUCKET` — `AiController` uses it only as a
+   transient scratch space for Amazon Transcribe (which requires an S3 input/output URI); it
+   uploads a segment, waits for the transcription job, then deletes both the input and output
+   objects immediately after (`AiController::transcribeAudio`'s `finally` block) — nothing is
+   left in the bucket between requests.
+
+### IAM policy JSON
+
+Least-privilege policy for the IAM user/role behind `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` — covers exactly the AWS calls this codebase makes (`MeetingController`,
+`AttendeeController`, `AiController`). Replace `YOUR_BUCKET_NAME` with the value of `AWS_BUCKET`.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ChimeSDKMeetings",
+            "Effect": "Allow",
+            "Action": [
+                "chime:CreateMeeting",
+                "chime:DeleteMeeting",
+                "chime:CreateAttendee"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "TranscribeSegments",
+            "Effect": "Allow",
+            "Action": [
+                "transcribe:StartTranscriptionJob",
+                "transcribe:GetTranscriptionJob",
+                "transcribe:DeleteTranscriptionJob"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "PollySynthesis",
+            "Effect": "Allow",
+            "Action": [
+                "polly:SynthesizeSpeech"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "TranscribeScratchSpace",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME/transcribe-input/*",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/transcribe-output/*"
+            ]
+        }
+    ]
+}
+```
+
+`chime:*`, `transcribe:*`, and `polly:SynthesizeSpeech` all require `Resource: "*"` — none of
+them support resource-level ARN restrictions in IAM (AWS API limitation, not a choice made
+here). The S3 statement is the only one scoped down, to the two prefixes `AiController`
+actually writes to inside your bucket — it deliberately does **not** grant blanket
+`s3:*`/`s3:GetObject` on the bucket, since nothing in this app's own IAM principal ever reads
+those objects back (Transcribe reads the input directly as a same-account service call, and
+the transcript is fetched over a presigned HTTPS URL, not the S3 API).
 
 ## Two SDKs, two jobs
 
@@ -551,9 +621,10 @@ contexts (a normal window as the owner, an incognito window as a guest) and try 
 ## Environment variables
 
 ```
-AWS_ACCESS_KEY_ID=       # IAM user/role with Chime SDK Meetings permissions
+AWS_ACCESS_KEY_ID=       # IAM user/role, see the IAM policy JSON in "AWS setup" above
 AWS_SECRET_ACCESS_KEY=
 AWS_DEFAULT_REGION=us-east-1   # must be a Chime SDK Meetings-supported region
+AWS_BUCKET=              # S3 bucket used as transient scratch space by AiController
 ```
 Read via `config('services.aws.*')` (`config/services.php`), not `config('services.ses.*')`
 — the `ses` block in that file is unrelated (Simple Email Service) and just happens to read

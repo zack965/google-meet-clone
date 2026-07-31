@@ -3,6 +3,9 @@
 namespace App\Providers;
 
 use Aws\ChimeSDKMeetings\ChimeSDKMeetingsClient;
+use Aws\Polly\PollyClient;
+use Aws\S3\S3Client;
+use Aws\TranscribeService\TranscribeServiceClient;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
@@ -17,6 +20,33 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->singleton(ChimeSDKMeetingsClient::class, fn (): ChimeSDKMeetingsClient => new ChimeSDKMeetingsClient([
+            'version' => 'latest',
+            'region' => config('services.aws.region'),
+            'credentials' => [
+                'key' => config('services.aws.key'),
+                'secret' => config('services.aws.secret'),
+            ],
+        ]));
+
+        $this->app->singleton(S3Client::class, fn (): S3Client => new S3Client([
+            'version' => 'latest',
+            'region' => config('services.aws.region'),
+            'credentials' => [
+                'key' => config('services.aws.key'),
+                'secret' => config('services.aws.secret'),
+            ],
+        ]));
+
+        $this->app->singleton(TranscribeServiceClient::class, fn (): TranscribeServiceClient => new TranscribeServiceClient([
+            'version' => 'latest',
+            'region' => config('services.aws.region'),
+            'credentials' => [
+                'key' => config('services.aws.key'),
+                'secret' => config('services.aws.secret'),
+            ],
+        ]));
+
+        $this->app->singleton(PollyClient::class, fn (): PollyClient => new PollyClient([
             'version' => 'latest',
             'region' => config('services.aws.region'),
             'credentials' => [

@@ -1,10 +1,13 @@
 import { Head, router, usePage } from '@inertiajs/react';
+import { useCallback } from 'react';
+import AiController from '@/actions/App/Http/Controllers/AiController';
 import MeetingController from '@/actions/App/Http/Controllers/MeetingController';
 import CallRoom from '@/components/meeting/call-room';
 import Lobby from '@/components/meeting/lobby';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { useChimeMeeting } from '@/hooks/use-chime-meeting';
+import { useSilenceRecorder } from '@/hooks/use-silence-recorder';
 import { dashboard, home } from '@/routes';
 
 type Props = {
@@ -16,11 +19,63 @@ type Props = {
     };
 };
 
+/** Reads the CSRF cookie Laravel's `web` middleware sets, for a raw `fetch` upload. */
+function readCsrfCookie(): string {
+    const match = document.cookie.match(/(?:^|; )XSRF-TOKEN=([^;]*)/);
+
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
 export default function MeetingShow({ meeting }: Props) {
     const { auth } = usePage().props;
     const authenticatedName = auth.user ? auth.user.name : null;
 
     const chime = useChimeMeeting(meeting.uuid);
+    const localAttendeeId = chime.roster.find((entry) => entry.isLocal)
+        ?.attendeeId;
+
+    const handleSegment = useCallback(
+        async (blob: Blob) => {
+            if (!localAttendeeId) {
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('audio', blob, 'segment.webm');
+
+            try {
+                const response = await fetch(
+                    AiController.processSegment([
+                        meeting.uuid,
+                        localAttendeeId,
+                    ]).url,
+                    {
+                        method: 'POST',
+                        body: formData,
+                        credentials: 'same-origin',
+                        headers: {
+                            'X-XSRF-TOKEN': readCsrfCookie(),
+                            Accept: 'audio/mpeg',
+                        },
+                    },
+                );
+
+                if (!response.ok) {
+                    return;
+                }
+
+                await chime.playSynthesizedAudio(await response.blob());
+            } catch (error) {
+                console.error(
+                    '[MeetingShow] failed to process audio segment',
+                    error,
+                );
+            }
+        },
+        [chime, localAttendeeId, meeting.uuid],
+    );
+
+    useSilenceRecorder(chime.audioVideo, chime.localAudioStream, handleSegment);
 
     const leaveTo = auth.user ? dashboard() : home();
 

@@ -1,6 +1,11 @@
 <?php
 
+use Aws\ChimeSDKMeetings\ChimeSDKMeetingsClient;
+use Aws\Polly\PollyClient;
+use Aws\S3\S3Client;
+use Aws\TranscribeService\TranscribeServiceClient;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Mockery\MockInterface;
 use Tests\TestCase;
 
 /*
@@ -53,11 +58,50 @@ function something()
  * Bind a Mockery double for the AWS Chime SDK client into the container so
  * tests never hit real AWS infrastructure.
  */
-function mockChimeClient(): \Mockery\MockInterface
+function mockChimeClient(): MockInterface
 {
-    $mock = Mockery::mock(\Aws\ChimeSDKMeetings\ChimeSDKMeetingsClient::class);
+    $mock = Mockery::mock(ChimeSDKMeetingsClient::class);
 
-    app()->instance(\Aws\ChimeSDKMeetings\ChimeSDKMeetingsClient::class, $mock);
+    app()->instance(ChimeSDKMeetingsClient::class, $mock);
+
+    return $mock;
+}
+
+/**
+ * Bind a Mockery double for the AWS S3 client into the container so tests
+ * never hit real AWS infrastructure.
+ */
+function mockS3Client(): MockInterface
+{
+    $mock = Mockery::mock(S3Client::class);
+
+    app()->instance(S3Client::class, $mock);
+
+    return $mock;
+}
+
+/**
+ * Bind a Mockery double for the AWS Transcribe client into the container so
+ * tests never hit real AWS infrastructure.
+ */
+function mockTranscribeClient(): MockInterface
+{
+    $mock = Mockery::mock(TranscribeServiceClient::class);
+
+    app()->instance(TranscribeServiceClient::class, $mock);
+
+    return $mock;
+}
+
+/**
+ * Bind a Mockery double for the AWS Polly client into the container so tests
+ * never hit real AWS infrastructure.
+ */
+function mockPollyClient(): MockInterface
+{
+    $mock = Mockery::mock(PollyClient::class);
+
+    app()->instance(PollyClient::class, $mock);
 
     return $mock;
 }

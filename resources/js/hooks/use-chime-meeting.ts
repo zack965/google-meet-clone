@@ -35,6 +35,7 @@ export function useChimeMeeting(meetingUuid: string) {
     const sessionRef = useRef<DefaultMeetingSession | null>(null);
     const audioElementRef = useRef<HTMLAudioElement | null>(null);
     const nameCacheRef = useRef<Map<string, string>>(new Map());
+    const localAudioStreamRef = useRef<MediaStream | null>(null);
 
     const { get: fetchAttendeeName } = useHttp({});
 
@@ -75,6 +76,7 @@ export function useChimeMeeting(meetingUuid: string) {
             audioElementRef.current = null;
         }
 
+        localAudioStreamRef.current = null;
         setRoster({});
     }, []);
 
@@ -105,9 +107,11 @@ export function useChimeMeeting(meetingUuid: string) {
 
                 const audioInputDevices =
                     await session.audioVideo.listAudioInputDevices();
-                await session.audioVideo.startAudioInput(
-                    audioInputDevices[0]?.deviceId ?? null,
-                );
+
+                localAudioStreamRef.current =
+                    (await session.audioVideo.startAudioInput(
+                        audioInputDevices[0]?.deviceId ?? null,
+                    )) ?? null;
 
                 const audioElement = document.createElement('audio');
                 audioElement.style.display = 'none';
@@ -238,6 +242,41 @@ export function useChimeMeeting(meetingUuid: string) {
         }
     }, []);
 
+    /**
+     * Temporarily swaps the meeting's audio input for a synthesized clip so
+     * every attendee hears it, then restores the real microphone stream.
+     */
+    const playSynthesizedAudio = useCallback(async (audioBlob: Blob) => {
+        const session = sessionRef.current;
+
+        if (!session) {
+            return;
+        }
+
+        const originalStream = localAudioStreamRef.current;
+        const audioContext = new AudioContext();
+
+        try {
+            const decoded = await audioContext.decodeAudioData(
+                await audioBlob.arrayBuffer(),
+            );
+            const destination = audioContext.createMediaStreamDestination();
+            const source = audioContext.createBufferSource();
+            source.buffer = decoded;
+            source.connect(destination);
+
+            await session.audioVideo.startAudioInput(destination.stream);
+
+            await new Promise<void>((resolve) => {
+                source.onended = () => resolve();
+                source.start();
+            });
+        } finally {
+            await session.audioVideo.startAudioInput(originalStream);
+            await audioContext.close();
+        }
+    }, []);
+
     useEffect(() => {
         return () => {
             void leave();
@@ -251,5 +290,8 @@ export function useChimeMeeting(meetingUuid: string) {
         join,
         leave,
         toggleMute,
+        playSynthesizedAudio,
+        audioVideo: sessionRef.current?.audioVideo ?? null,
+        localAudioStream: localAudioStreamRef.current,
     };
 }
